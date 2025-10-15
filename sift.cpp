@@ -1,6 +1,8 @@
 #define _USE_MATH_DEFINES
 #include "sift.hpp"
 
+#include <mpi.h>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -9,9 +11,9 @@
 #include <iostream>
 #include <tuple>
 #include <vector>
-#include "mpi_sift.hpp"
 
 #include "image.hpp"
+#include "mpi_sift.hpp"
 using namespace std;
 
 auto total_orientation_time = std::chrono::duration<double, std::milli>::zero();
@@ -45,7 +47,7 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
     // create a scale space pyramid of gaussian images
     // images in each octave are half the size of images in the previous one
     ScaleSpacePyramid pyramid = {num_octaves, imgs_per_octave,
-                                 std::vector<std::vector<Image>>(num_octaves)}; 
+                                 std::vector<std::vector<Image>>(num_octaves)};
     for (int i = 0; i < num_octaves; i++) {
         pyramid.octaves[i].reserve(imgs_per_octave);
         pyramid.octaves[i].push_back(std::move(base_img));
@@ -101,7 +103,7 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
     std::chrono::duration<double, std::milli> sift_duration =
         sift_end - sift_start;
 
-    std::cout << "generated dog : " << sift_duration.count() << " ms\n";
+    // std::cout << "generated dog : " << sift_duration.count() << " ms\n";
 
     return dog_pyramid;
 }
@@ -292,7 +294,7 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
     std::chrono::duration<double, std::milli> sift_duration =
         sift_end - sift_start;
 
-    std::cout << "find keypoints: " << sift_duration.count() << " ms\n";
+    // std::cout << "find keypoints: " << sift_duration.count() << " ms\n";
 
     return keypoints;
 }
@@ -329,7 +331,7 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid) {
     auto sift_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> sift_duration =
         sift_end - sift_start;
-    std::cout << "grad pyranmid: " << sift_duration.count() << " ms\n";
+    // std::cout << "grad pyranmid: " << sift_duration.count() << " ms\n";
 
     return grad_pyramid;
 }
@@ -527,57 +529,102 @@ std::vector<Keypoint> find_keypoints_and_descriptors(
     const Image& img, float sigma_min, int num_octaves, int scales_per_octave,
     float contrast_thresh, float edge_thresh, float lambda_ori,
     float lambda_desc) {
-
     assert(img.channels == 1 || img.channels == 3);
-    const Image& input = img.channels == 1 ? img : rgb_to_grayscale(img);
+    const Image& input = (img.channels == 1) ? img : rgb_to_grayscale(img);
 
-    int rank; MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    cout << input.channels << "HELLOOO" << endl;
-    // 1) Build Gaussian pyramid in parallel
-    // auto pyr_stripe = generate_gaussian_pyramid_mpi(
-    //     input, sigma_min, num_octaves, scales_per_octave, MPI_COMM_WORLD);
+    int rank, world;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
 
-    // // 2) Gather to rank 0
-    // ScaleSpacePyramid gaussian_pyramid =
-    //     gather_pyramid_from_stripes(pyr_stripe, MPI_COMM_WORLD);
+    std::chrono::high_resolution_clock::time_point start_time, end_time;
 
-    // 3) Only rank 0 continues
-    if (rank != 0) return {};
+    // --- Timing for Gaussian Pyramid ---
+    if (rank == 0) start_time = std::chrono::high_resolution_clock::now();
+
+    ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid_mpi(
+        input, sigma_min, num_octaves, scales_per_octave);
+
+    if (rank == 0) {
+        end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed =
+            end_time - start_time;
+        cout << "1. generate_gaussian_pyramid_mpi: " << elapsed.count() << " ms"
+             << endl;
+    }
+    ScaleSpacePyramid dog_pyramid;
+    std::vector<Keypoint> tmp_kps;
+    ScaleSpacePyramid grad_pyramid;
+    // The rest of the pipeline only runs on Rank 0, where the full pyramid
+    // exists.
+    if (rank == 0) {
+        // --- Timing for DoG Pyramid ---
+        start_time = std::chrono::high_resolution_clock::now();
+        dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
+        end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed_dog =
+            end_time - start_time;
+        cout << "2. generate_dog_pyramid: " << elapsed_dog.count() << " ms"
+             << endl;
+
+        // --- Timing for Find Keypoints ---
+        start_time = std::chrono::high_resolution_clock::now();
+        tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
+        end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed_kps =
+            end_time - start_time;
+        cout << "3. find_keypoints: " << elapsed_kps.count() << " ms" << endl;
+
+        // --- Timing for Gradient Pyramid ---
+        start_time = std::chrono::high_resolution_clock::now();
+        grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
+        end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed_grad =
+            end_time - start_time;
+        cout << "4. generate_gradient_pyramid: " << elapsed_grad.count()
+             << " ms" << endl;
+    }
+    // --- Timing for Orientations and Descriptors ---
+    start_time = std::chrono::high_resolution_clock::now();
+    auto total_orientation_time =
+        std::chrono::duration<double, std::milli>::zero();
+    auto total_descriptor_time =
+        std::chrono::duration<double, std::milli>::zero();
+
+    std::vector<Keypoint> kps;
+    cout << tmp_kps.size() << endl;
+    kps.reserve(tmp_kps.size() * 2);
+    for (Keypoint& kp_tmp : tmp_kps) {
+        auto ori_start = std::chrono::high_resolution_clock::now();
+
+        std::vector<float> orientations = find_keypoint_orientations(
+            kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
+        auto ori_end = std::chrono::high_resolution_clock::now();
+        total_orientation_time += (ori_end - ori_start);
+        for (float theta : orientations) {
+            Keypoint kp = kp_tmp;
+            auto desc_start = std::chrono::high_resolution_clock::now();
+            compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
+            auto desc_end = std::chrono::high_resolution_clock::now();
+            total_descriptor_time += (desc_end - desc_start);
+            kps.push_back(kp);
+        }
+    }
+    end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_desc =
+        end_time - start_time;
+    cout << "5. compute_orientations_and_descriptors: " << elapsed_desc.count()
+         << " ms" << endl;
+    cout << "   - 5a. find_keypoint_orientations (sum): "
+         << total_orientation_time.count() << " ms" << endl;
+    cout << "   - 5b. compute_keypoint_descriptor (sum): "
+         << total_descriptor_time.count() << " ms" << endl;
+
+    return kps;
+
+    // Non-zero ranks return an empty vector as they did no work after the
+    // pyramid generation.
     return {};
-    // Continue SIFT pipeline
-    // ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-    // std::vector<Keypoint> tmp_kps =
-    //     find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
-    // ScaleSpacePyramid grad_pyramid =
-    //     generate_gradient_pyramid(gaussian_pyramid);
-
-    // std::vector<Keypoint> kps;
-    // kps.reserve(tmp_kps.size() * 2);
-    // #pragma omp parallel
-    // {
-    //     std::vector<Keypoint> local;
-    //     #pragma omp for schedule(dynamic, 64) nowait
-    //     for (size_t i = 0; i < tmp_kps.size(); ++i) {
-    //         Keypoint kp_tmp = tmp_kps[i];
-    //         std::vector<float> orientations =
-    //             find_keypoint_orientations(kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
-    //         for (float theta : orientations) {
-    //             Keypoint kp = kp_tmp;
-    //             compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
-    //             local.push_back(kp);
-    //         }
-    //     }
-    //     #pragma omp critical
-    //     kps.insert(kps.end(), local.begin(), local.end());
-    // }
-
-    // std::cout << "Total time for find keypoint orientations: "
-    //           << total_orientation_time.count() << " ms\n";
-    // std::cout << "Total time for compute keypoint descriptors: "
-    //           << total_descriptor_time.count() << " ms\n";
-    // return kps;
 }
-
 
 float euclidean_dist(std::array<uint8_t, 128>& a, std::array<uint8_t, 128>& b) {
     float dist = 0;

@@ -13,6 +13,7 @@ struct Image {
     Image& operator=(const Image& other);
     Image(Image&& other);
     Image& operator=(Image&& other);
+    bool operator==(const Image& other) const;
     int width;
     int height;
     int channels;

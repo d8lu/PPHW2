@@ -60,6 +60,7 @@ descriptor_match_percentage, validate_output = check_descriptor(test_txt, golden
 if descriptor_match_percentage is not None and validate_output is not None:
     # print(f"Descriptor match percentage: {descriptor_match_percentage:.6f}")
     score, diff = ssim(img1, img2, full=True)
+    print(descriptor_match_percentage, score)
     # print(f"SSIM: {score:.6f}")
 
     if descriptor_match_percentage >= 0.98 and score >= 0.98:

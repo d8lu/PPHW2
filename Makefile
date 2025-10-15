@@ -1,7 +1,7 @@
 # Makefile for hw2_sift project
 MPICXX   = mpicxx
 # If mpicxx is Apple Clang, see note below for OpenMP flags.
-MPIFLAGS = -std=c++17 -O3 -fopenmp
+MPIFLAGS = -std=c++17 -O3 -fopenmp -DDEBUG_MPI_CHECK
 INCLUDES = -I.
 
 TARGET   = hw2
@@ -28,3 +28,4 @@ clean:
 .PHONY: all clean
 
 #export OMPI_CXX=/opt/homebrew/bin/g++-15
+# python3 validate.py ./results/01.txt ./goldens/01.txt ./results/01.jpg ./goldens/01.jpg
