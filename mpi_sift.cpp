@@ -73,15 +73,16 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
         int other_y1 = other_split.y1;
 
         // --- Do I need to RECEIVE from this `other_rank`? ---
-        
+
         // Check for my TOP halo requirements
         int needed_top_y0 = my_y0 - center;
         int intersect_top_y0 = std::max(needed_top_y0, other_y0);
         int intersect_top_y1 = std::min(my_y0, other_y1);
-        
+
         if (intersect_top_y0 < intersect_top_y1) {
             int num_rows = intersect_top_y1 - intersect_top_y0;
-            printf("[Rank %d] Planning to RECV %d rows for my TOP halo from Rank %d.\n", rank, num_rows, other_rank); fflush(stdout);
+            printf("[Rank %d] Planning to RECV %d rows for my TOP halo from Rank %d.\n", rank, num_rows, other_rank);
+            fflush(stdout);
             int recv_offset_in_halo = intersect_top_y0 - needed_top_y0;
             float* recv_ptr = local_with_halos.data + recv_offset_in_halo * W;
             MPI_Request req;
@@ -97,7 +98,8 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
 
         if (intersect_bot_y0 < intersect_bot_y1) {
             int num_rows = intersect_bot_y1 - intersect_bot_y0;
-            printf("[Rank %d] Planning to RECV %d rows for my BOTTOM halo from Rank %d.\n", rank, num_rows, other_rank); fflush(stdout);
+            printf("[Rank %d] Planning to RECV %d rows for my BOTTOM halo from Rank %d.\n", rank, num_rows, other_rank);
+            fflush(stdout);
 
             int recv_offset_in_halo = (local_h + center) + (intersect_bot_y0 - needed_bot_y0);
             float* recv_ptr = local_with_halos.data + recv_offset_in_halo * W;
@@ -107,7 +109,7 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
         }
 
         // --- Do I need to SEND to this `other_rank`? ---
-        
+
         // Check if they need a piece of my data for THEIR top halo
         int other_needed_top_y0 = other_y0 - center;
         int other_intersect_top_y0 = std::max(other_needed_top_y0, my_y0);
@@ -115,7 +117,8 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
 
         if (other_intersect_top_y0 < other_intersect_top_y1) {
             int num_rows = other_intersect_top_y1 - other_intersect_top_y0;
-            printf("[Rank %d] Planning to SEND %d rows to Rank %d for THEIR top halo.\n", rank, num_rows, other_rank); fflush(stdout);
+            printf("[Rank %d] Planning to SEND %d rows to Rank %d for THEIR top halo.\n", rank, num_rows, other_rank);
+            fflush(stdout);
 
             int send_offset_in_my_data = other_intersect_top_y0 - my_y0;
             const float* send_ptr = img.data + send_offset_in_my_data * W;
@@ -132,7 +135,8 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
 
         if (other_intersect_bot_y0 < other_intersect_bot_y1) {
             int num_rows = other_intersect_bot_y1 - other_intersect_bot_y0;
-            printf("[Rank %d] Planning to SEND %d rows to Rank %d for THEIR bottom halo.\n", rank, num_rows, other_rank); fflush(stdout);
+            printf("[Rank %d] Planning to SEND %d rows to Rank %d for THEIR bottom halo.\n", rank, num_rows, other_rank);
+            fflush(stdout);
 
             int send_offset_in_my_data = other_intersect_bot_y0 - my_y0;
             const float* send_ptr = img.data + send_offset_in_my_data * W;
@@ -141,15 +145,16 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
             requests.push_back(req);
         }
     }
-    
+
     // Execute all planned communications
     if (!requests.empty()) {
-        printf("[Rank %d] Entering MPI_Waitall for %zu requests...\n", rank, requests.size()); fflush(stdout);
+        printf("[Rank %d] Entering MPI_Waitall for %zu requests...\n", rank, requests.size());
+        fflush(stdout);
         MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
-        printf("[Rank %d] Exited MPI_Waitall.\n", rank); fflush(stdout);
-
+        printf("[Rank %d] Exited MPI_Waitall.\n", rank);
+        fflush(stdout);
     }
-    
+
     // 4. BOUNDARY CONDITIONS (clamp-to-edge)
     // Manually handle parts of the halo that fall off the global image.
     if (rank == 0) {
@@ -191,7 +196,7 @@ Image guassian_blur_mpi(const Image& img, float sigma, int rank, int world,
             filtered.set_pixel(x, y, 0, pixel_sum);
         }
     }
-    
+
     return filtered;
 }
 
@@ -254,9 +259,9 @@ ScaleSpacePyramid generate_gaussian_pyramid_mpi(const Image& img,
     // Mimic serial implementation for consistency
     sigma_vals[0] = base_sigma;
     for (int i = 1; i < imgs_per_octave; i++) {
-        float sigma_prev = base_sigma * std::pow(k, i-1);
+        float sigma_prev = base_sigma * std::pow(k, i - 1);
         float sigma_total = k * sigma_prev;
-        sigma_vals[i] = std::sqrt(sigma_total*sigma_total - sigma_prev*sigma_prev);
+        sigma_vals[i] = std::sqrt(sigma_total * sigma_total - sigma_prev * sigma_prev);
     }
 
     std::vector<std::vector<Image>> local_octaves(num_octaves);
@@ -273,47 +278,20 @@ ScaleSpacePyramid generate_gaussian_pyramid_mpi(const Image& img,
             Image blurred =
                 guassian_blur_mpi(local_octaves[oi][si - 1], sigma_vals[si],
                                   rank, world, MPI_COMM_WORLD, current_H);
-            
-            // SANITY CHECK: When running with 1 process, compare the first MPI blur result
-            // with the serial blur result. This helps isolate bugs.
-            // if (world == 1 && oi == 0 && si == 1) {
-            //     cout << "[Sanity Check] Comparing MPI blur to serial blur..." << endl;
-            //     Image blurred_ref = gaussian_blur(local_octaves[oi][si - 1], sigma_vals[si]);
-                
-            //     bool images_match = true;
-            //     if (blurred.size != blurred_ref.size) {
-            //         images_match = false;
-            //     } else {
-            //         const float tolerance = 1e-5f;
-            //         for (int i = 0; i < blurred.size; ++i) {
-            //             if (std::abs(blurred.data[i] - blurred_ref.data[i]) > tolerance) {
-            //                 images_match = false;
-            //                 cout << "[Sanity Check] Mismatch at pixel " << i << ": MPI=" << blurred.data[i] << ", Serial=" << blurred_ref.data[i] << endl;
-            //                 break;
-            //             }
-            //         }
-            //     }
-
-            //     if (images_match) {
-            //         cout << "[Sanity Check] SUCCESS: guassian_blur_mpi output matches serial version." << endl;
-            //     } else {
-            //         cout << "[Sanity Check] FAILURE: guassian_blur_mpi output does NOT match serial version." << endl;
-            //     }
-            // }
             local_octaves[oi].push_back(std::move(blurred));
         }
-        
+
         // downsample for next octave
         if (oi + 1 < num_octaves) {
-            const Image& local_src = local_octaves[oi][imgs_per_octave-3];
+            const Image& local_src = local_octaves[oi][imgs_per_octave - 3];
 
             Image gathered;
             if (rank == 0) gathered = Image(current_W, current_H, 1);
-            
-            if(rank == 0) {
+
+            if (rank == 0) {
                 counts.assign(world, 0);
                 displs.assign(world, 0);
-                for(int r=0; r<world; ++r) {
+                for (int r = 0; r < world; ++r) {
                     auto s = split_rows(current_H, world, r);
                     counts[r] = (s.y1 - s.y0) * current_W;
                     displs[r] = s.y0 * current_W;
@@ -341,11 +319,11 @@ ScaleSpacePyramid generate_gaussian_pyramid_mpi(const Image& img,
             Image next_local(Wn, split_n.y1 - split_n.y0, 1);
 
             if (rank == 0) {
-                counts.assign(world,0);
-                displs.assign(world,0);
+                counts.assign(world, 0);
+                displs.assign(world, 0);
                 for (int r = 0; r < world; ++r) {
                     auto s = split_rows(Hn, world, r);
-                    counts[r] = (s.y1-s.y0) * Wn;
+                    counts[r] = (s.y1 - s.y0) * Wn;
                     displs[r] = s.y0 * Wn;
                 }
             }
@@ -360,46 +338,55 @@ ScaleSpacePyramid generate_gaussian_pyramid_mpi(const Image& img,
             current_W = Wn;
         }
     }
-    
+
     // ---- GATHER FINAL PYRAMID TO RANK 0 ----
     ScaleSpacePyramid pyramid;
-    if (rank == 0) {
-        pyramid.num_octaves = num_octaves;
-        pyramid.imgs_per_octave = imgs_per_octave;
-        pyramid.octaves.assign(num_octaves, {});
-    }
-    
-    int H_o = H;
-    int W_o = W;
-    for (int oi = 0; oi < num_octaves; ++oi) {
-        if (rank == 0) {
-            pyramid.octaves[oi].resize(imgs_per_octave);
-             counts.assign(world, 0);
-             displs.assign(world, 0);
-            for (int r = 0; r < world; ++r) {
-                auto s = split_rows(H_o, world, r);
-                counts[r] = (s.y1 - s.y0) * W_o;
-                displs[r] = s.y0 * W_o;
-            }
-        }
+    pyramid.octaves = std::move(local_octaves);
 
-        for (int si = 0; si < imgs_per_octave; ++si) {
-            const Image& local_im = local_octaves[oi][si];
-            if (rank == 0) pyramid.octaves[oi][si] = Image(W_o, H_o, 1);
+    pyramid.num_octaves = num_octaves;
+    pyramid.imgs_per_octave = imgs_per_octave;
+    return pyramid;
+    // if (rank == 0) {
+    //     pyramid.num_octaves = num_octaves;
+    //     pyramid.imgs_per_octave = imgs_per_octave;
+    //     pyramid.octaves.assign(num_octaves, {});
+    // }
 
-            MPI_Gatherv(local_im.data, local_im.width * local_im.height,
-                        MPI_FLOAT,
-                        rank == 0 ? pyramid.octaves[oi][si].data : nullptr,
-                        rank == 0 ? counts.data() : nullptr,
-                        rank == 0 ? displs.data() : nullptr, MPI_FLOAT, 0,
-                        MPI_COMM_WORLD);
-        }
-        H_o /= 2;
-        W_o /= 2;
-    }
+    // int H_o = H;
+    // int W_o = W;
+    // for (int oi = 0; oi < num_octaves; ++oi) {
+    //     if (rank == 0) {
+    //         pyramid.octaves[oi].resize(imgs_per_octave);
+    //          counts.assign(world, 0);
+    //          displs.assign(world, 0);
+    //         for (int r = 0; r < world; ++r) {
+    //             auto s = split_rows(H_o, world, r);
+    //             counts[r] = (s.y1 - s.y0) * W_o;
+    //             displs[r] = s.y0 * W_o;
+    //         }
+    //     }
 
-    if (rank == 0)
-        return pyramid;
-    else
-        return ScaleSpacePyramid{0, 0, {}};
+    //     for (int si = 0; si < imgs_per_octave; ++si) {
+    //         const Image& local_im = local_octaves[oi][si];
+    //         if (rank == 0) pyramid.octaves[oi][si] = Image(W_o, H_o, 1);
+
+    //         MPI_Gatherv(local_im.data, local_im.width * local_im.height,
+    //                     MPI_FLOAT,
+    //                     rank == 0 ? pyramid.octaves[oi][si].data : nullptr,
+    //                     rank == 0 ? counts.data() : nullptr,
+    //                     rank == 0 ? displs.data() : nullptr, MPI_FLOAT, 0,
+    //                     MPI_COMM_WORLD);
+    //     }
+    //     H_o /= 2;
+    //     W_o /= 2;
+    // }
+
+    // if (rank == 0)
+    //     return pyramid;
+    // else
+    //     return ScaleSpacePyramid{0, 0, {}};
+}
+
+ScaleSpacePyramid generate_dog_pyramid_mpi(const ScaleSpacePyramid& img_pyramid, int rank, int world_size) {
+    return {};
 }

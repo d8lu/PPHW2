@@ -65,8 +65,10 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
 
 ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid);
 
-std::vector<float> find_keypoint_orientations(Keypoint& kp, const ScaleSpacePyramid& grad_pyramid,
-                                              float lambda_ori=LAMBDA_ORI, float lambda_desc=LAMBDA_DESC);
+std::vector<float> find_keypoint_orientations(
+    Keypoint& kp, const Image& img_grad,
+    const std::vector<float>& top_ghost, const std::vector<float>& bottom_ghost,
+    int rows_in_ghost_buffer, float lambda_ori, float lambda_desc);
 
 void compute_keypoint_descriptor(Keypoint& kp, float theta, const ScaleSpacePyramid& grad_pyramid,
                                  float lambda_desc=LAMBDA_DESC);

@@ -8,6 +8,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <tuple>
 #include <vector>
@@ -18,7 +19,15 @@ using namespace std;
 
 auto total_orientation_time = std::chrono::duration<double, std::milli>::zero();
 auto total_descriptor_time = std::chrono::duration<double, std::milli>::zero();
-
+struct RowSplit {
+    int y0, y1;
+};  // half-open [y0, y1)
+inline RowSplit split_rows(int H, int P, int r) {
+    int base = H / P, rem = H % P;
+    int y0 = r * base + std::min(r, rem);
+    int cnt = base + (r < rem ? 1 : 0);
+    return {y0, y0 + cnt};
+}
 ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
                                             int num_octaves,
                                             int scales_per_octave) {
@@ -82,8 +91,12 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
 
 // generate pyramid of difference of gaussians (DoG) images
 ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
-    auto sift_start = std::chrono::high_resolution_clock::now();
-
+    for (int i = 0; i < img_pyramid.num_octaves; i++) {
+        for (int j = 0; j < img_pyramid.imgs_per_octave; j++) {
+            cout << img_pyramid.octaves[i][j].size << " ";
+        }
+        cout << endl;
+    }
     ScaleSpacePyramid dog_pyramid = {
         img_pyramid.num_octaves, img_pyramid.imgs_per_octave - 1,
         std::vector<std::vector<Image>>(img_pyramid.num_octaves)};
@@ -99,41 +112,78 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
             dog_pyramid.octaves[i].push_back(diff);
         }
     }
-    auto sift_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> sift_duration =
-        sift_end - sift_start;
-
-    // std::cout << "generated dog : " << sift_duration.count() << " ms\n";
-
     return dog_pyramid;
 }
 
-bool point_is_extremum(const std::vector<Image>& octave, int scale, int x,
-                       int y) {
-    const Image& img = octave[scale];
-    const Image& prev = octave[scale - 1];
-    const Image& next = octave[scale + 1];
+bool point_is_extremum(const std::vector<Image>& octave, int scale, int x, int y,
+                       int rank, int world_size, int W, int H,
+                       const float* prev_top_halo, const float* curr_top_halo, const float* next_top_halo,
+                       const float* prev_bot_halo, const float* curr_bot_halo, const float* next_bot_halo) {
+    float val = octave[scale].get_pixel(x, y, 0);
+    bool is_max = true;
+    bool is_min = true;
 
-    bool is_min = true, is_max = true;
-    float val = img.get_pixel(x, y, 0), neighbor;
+    // Loop over the 26 neighbors in the 3x3x3 cube (3 scales, 3 rows, 3 columns)
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                // Skip comparing the point to itself
+                if (dx == 0 && dy == 0 && dz == 0) {
+                    continue;
+                }
 
-    for (int dx : {-1, 0, 1}) {
-        for (int dy : {-1, 0, 1}) {
-            neighbor = prev.get_pixel(x + dx, y + dy, 0);
-            if (neighbor > val) is_max = false;
-            if (neighbor < val) is_min = false;
+                float neighbor_val;
+                int ny = y + dy;
+                int nx = x + dx;
 
-            neighbor = next.get_pixel(x + dx, y + dy, 0);
-            if (neighbor > val) is_max = false;
-            if (neighbor < val) is_min = false;
+                // Select the correct image and halo buffers based on the scale offset (dz)
+                const Image* neighbor_img_ptr;
+                const float* top_halo_ptr;
+                const float* bot_halo_ptr;
 
-            neighbor = img.get_pixel(x + dx, y + dy, 0);
-            if (neighbor > val) is_max = false;
-            if (neighbor < val) is_min = false;
+                if (dz == -1) {  // Previous scale
+                    neighbor_img_ptr = &octave[scale - 1];
+                    top_halo_ptr = prev_top_halo;
+                    bot_halo_ptr = prev_bot_halo;
+                } else if (dz == 0) {  // Current scale
+                    neighbor_img_ptr = &octave[scale];
+                    top_halo_ptr = curr_top_halo;
+                    bot_halo_ptr = curr_bot_halo;
+                } else {  // Next scale (dz == 1)
+                    neighbor_img_ptr = &octave[scale + 1];
+                    top_halo_ptr = next_top_halo;
+                    bot_halo_ptr = next_bot_halo;
+                }
 
-            if (!is_min && !is_max) return false;
+                // --- This is the core logic for using the halos ---
+                if (ny < 0) {
+                    // This neighbor is in the process above.
+                    // If we're rank 0, we're on the global edge, so it can't be an extremum.
+                    if (rank == 0) return false;
+                    neighbor_val = top_halo_ptr[nx];
+                } else if (ny >= H) {
+                    // This neighbor is in the process below.
+                    // If we're the last rank, we're on the global edge.
+                    if (rank == world_size - 1) return false;
+                    neighbor_val = bot_halo_ptr[nx];
+                } else {
+                    // This neighbor is an interior point within this process's chunk.
+                    neighbor_val = neighbor_img_ptr->get_pixel(nx, ny, 0);
+                }
+
+                // Update flags and check for early exit
+                if (neighbor_val > val) is_max = false;
+                if (neighbor_val < val) is_min = false;
+
+                if (!is_min && !is_max) {
+                    return false;  // Optimization: exit as soon as we know it's not an extremum
+                }
+            }
         }
     }
+
+    // If the loops complete, the point is an extremum if it was either a pure
+    // minimum or a pure maximum relative to all its neighbors.
     return true;
 }
 
@@ -258,81 +308,146 @@ bool refine_or_discard_keypoint(Keypoint& kp, const std::vector<Image>& octave,
 
 std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
                                      float contrast_thresh, float edge_thresh) {
-    auto sift_start = std::chrono::high_resolution_clock::now();
-
+    int rank, world;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
     std::vector<Keypoint> keypoints;
     for (int i = 0; i < dog_pyramid.num_octaves; i++) {
         const std::vector<Image>& octave = dog_pyramid.octaves[i];
+
         for (int j = 1; j < dog_pyramid.imgs_per_octave - 1; j++) {
-            const Image& img = octave[j];
-#pragma omp parallel
-            {
-                std::vector<Keypoint> local;
-#pragma omp for nowait schedule(static)
-                for (int x = 1; x < img.width - 1; x++) {
-                    for (int y = 1; y < img.height - 1; y++) {
-                        if (std::abs(img.get_pixel(x, y, 0)) <
-                            0.8 * contrast_thresh) {
-                            continue;
-                        }
-                        if (point_is_extremum(octave, j, x, y)) {
-                            Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
-                            bool kp_is_valid = refine_or_discard_keypoint(
-                                kp, octave, contrast_thresh, edge_thresh);
-                            if (kp_is_valid) {
-                                local.push_back(kp);
-                            }
+            const Image& curr_img = octave[j];
+            const Image& prev_img = octave[j - 1];
+            const Image& next_img = octave[j + 1];
+            const int H = curr_img.height;
+            const int W = curr_img.width;
+            const int PACKED_SIZE = 3 * W;
+            vector<float> send_top(PACKED_SIZE);
+            vector<float> send_bot(PACKED_SIZE);
+            memcpy(send_top.data(), prev_img.data, W * sizeof(float));
+            memcpy(send_top.data() + W, curr_img.data, W * sizeof(float));
+            memcpy(send_top.data() + 2 * W, next_img.data, W * sizeof(float));
+
+            memcpy(send_bot.data(), prev_img.data + (H - 1) * W, W * sizeof(float));
+            memcpy(send_bot.data() + W, curr_img.data + (H - 1) * W, W * sizeof(float));
+            memcpy(send_bot.data() + 2 * W, next_img.data + (H - 1) * W, W * sizeof(float));
+
+            vector<float> rec_top(PACKED_SIZE);
+            vector<float> rec_bot(PACKED_SIZE);
+            int top_neighbor = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
+            int bottom_neighbor = (rank < world - 1) ? rank + 1 : MPI_PROC_NULL;
+
+            MPI_Sendrecv(send_top.data(), PACKED_SIZE, MPI_FLOAT, top_neighbor, 0,
+                         rec_bot.data(), PACKED_SIZE, MPI_FLOAT, bottom_neighbor, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            // Exchange bottom halos (send my packed bottom rows, receive their top rows)
+            MPI_Sendrecv(send_bot.data(), PACKED_SIZE, MPI_FLOAT, bottom_neighbor, 1,
+                         rec_top.data(), PACKED_SIZE, MPI_FLOAT, top_neighbor, 1,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            const float* prev_top_halo = rec_top.data();
+            const float* curr_top_halo = rec_top.data() + W;
+            const float* next_top_halo = rec_top.data() + 2 * W;
+            const float* prev_bot_halo = rec_bot.data();
+            const float* curr_bot_halo = rec_bot.data() + W;
+            const float* next_bot_halo = rec_bot.data() + 2 * W;
+
+            // #pragma omp parallel
+            // {
+            std::vector<Keypoint> local;
+            // #pragma omp for nowait schedule(static)
+            for (int x = 1; x < curr_img.width - 1; x++) {
+                for (int y = (rank == 0 ? 1 : 0); y < curr_img.height - (rank == world - 1 ? 1 : 0); y++) {
+                    if (std::abs(curr_img.get_pixel(x, y, 0)) <
+                        0.8 * contrast_thresh) {
+                        continue;
+                    }
+                    if (point_is_extremum(octave, j, x, y, rank, world, W, H, prev_top_halo, curr_top_halo, next_top_halo, prev_bot_halo, curr_bot_halo, next_bot_halo)) {
+                        Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
+                        bool kp_is_valid = refine_or_discard_keypoint(
+                            kp, octave, contrast_thresh, edge_thresh);
+                        if (kp_is_valid) {
+                            local.push_back(kp);
                         }
                     }
                 }
-#pragma omp critical
-                keypoints.insert(keypoints.end(), local.begin(), local.end());
             }
+            // #pragma omp critical
+            keypoints.insert(keypoints.end(), local.begin(), local.end());
+            // }
         }
     }
-    auto sift_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> sift_duration =
-        sift_end - sift_start;
-
-    // std::cout << "find keypoints: " << sift_duration.count() << " ms\n";
-
     return keypoints;
 }
 
 // calculate x and y derivatives for all images in the input pyramid
 ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid) {
-    auto sift_start = std::chrono::high_resolution_clock::now();
+    int rank, world;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            cout << pyramid.octaves[i][j].size << ' ';
+        }
+        cout << endl;
+    }
     ScaleSpacePyramid grad_pyramid = {
         pyramid.num_octaves, pyramid.imgs_per_octave,
         std::vector<std::vector<Image>>(pyramid.num_octaves)};
+
     for (int i = 0; i < pyramid.num_octaves; i++) {
-        grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
-        int width = pyramid.octaves[i][0].width;
-        int height = pyramid.octaves[i][0].height;
+        grad_pyramid.octaves[i].reserve(pyramid.imgs_per_octave);
         for (int j = 0; j < pyramid.imgs_per_octave; j++) {
-            Image grad(width, height, 2);
-            float gx, gy;
-#pragma omp parallel for collapse(2) schedule(static)
-            for (int x = 1; x < grad.width - 1; x++) {
-                for (int y = 1; y < grad.height - 1; y++) {
-                    gx = (pyramid.octaves[i][j].get_pixel(x + 1, y, 0) -
-                          pyramid.octaves[i][j].get_pixel(x - 1, y, 0)) *
-                         0.5;
-                    grad.set_pixel(x, y, 0, gx);
-                    gy = (pyramid.octaves[i][j].get_pixel(x, y + 1, 0) -
-                          pyramid.octaves[i][j].get_pixel(x, y - 1, 0)) *
-                         0.5;
-                    grad.set_pixel(x, y, 1, gy);
+            const Image& source_stripe = pyramid.octaves[i][j];
+            const int W = source_stripe.width;
+            const int H = source_stripe.height;
+
+            vector<float> top_ghost_row(W, 0.0f);
+            vector<float> bottom_ghost_row(W, 0.0f);
+            int top_neighbor = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
+            int bottom_neighbor = (rank < world - 1) ? rank + 1 : MPI_PROC_NULL;
+
+            // Send UP, receive FROM BELOW into the bottom ghost buffer
+            MPI_Sendrecv(source_stripe.data, W, MPI_FLOAT, top_neighbor, 0,
+                         bottom_ghost_row.data(), W, MPI_FLOAT, bottom_neighbor, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            // Send DOWN, receive FROM ABOVE into the top ghost buffer
+            const float* my_last_row = source_stripe.data + (H - 1) * W;
+            MPI_Sendrecv(my_last_row, W, MPI_FLOAT, bottom_neighbor, 1,
+                         top_ghost_row.data(), W, MPI_FLOAT, top_neighbor, 1,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            Image grad_stripe(W, H, 2);  // Initialized to zeros
+
+// --- FIX #2: Loop Bounds to Match Serial ---
+#pragma omp parallel for collapse(2)
+            for (int x = 1; x < W - 1; ++x) {
+                // This logic correctly skips the global image boundaries
+                for (int y = (rank == 0 ? 1 : 0); y < (rank == world - 1 ? H - 1 : H); ++y) {
+                    float gx, gy;
+                    gx = (source_stripe.get_pixel(x + 1, y, 0) -
+                          source_stripe.get_pixel(x - 1, y, 0)) *
+                         0.5f;
+
+                    // The internal logic now correctly uses the repaired halo data
+                    if (y == 0) {  // Only true for ranks > 0
+                        gy = (source_stripe.get_pixel(x, y + 1, 0) - top_ghost_row[x]) * 0.5f;
+                    } else if (y == H - 1) {  // Only true for ranks < world-1
+                        gy = (bottom_ghost_row[x] - source_stripe.get_pixel(x, y - 1, 0)) * 0.5f;
+                    } else {  // Interior pixels for all ranks
+                        gy = (source_stripe.get_pixel(x, y + 1, 0) -
+                              source_stripe.get_pixel(x, y - 1, 0)) *
+                             0.5f;
+                    }
+
+                    grad_stripe.set_pixel(x, y, 0, gx);
+                    grad_stripe.set_pixel(x, y, 1, gy);
                 }
             }
-            grad_pyramid.octaves[i].push_back(grad);
+            grad_pyramid.octaves[i].push_back(grad_stripe);
         }
     }
-    auto sift_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> sift_duration =
-        sift_end - sift_start;
-    // std::cout << "grad pyranmid: " << sift_duration.count() << " ms\n";
-
     return grad_pyramid;
 }
 
@@ -471,8 +586,6 @@ void hists_to_vec(float histograms[N_HIST][N_HIST][N_ORI],
 void compute_keypoint_descriptor(Keypoint& kp, float theta,
                                  const ScaleSpacePyramid& grad_pyramid,
                                  float lambda_desc) {
-    auto sift_start = std::chrono::high_resolution_clock::now();
-
     float pix_dist = MIN_PIX_DIST * std::pow(2, kp.octave);
     const Image& img_grad = grad_pyramid.octaves[kp.octave][kp.scale];
     float histograms[N_HIST][N_HIST][N_ORI] = {0};
@@ -521,8 +634,70 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
 
     // build feature vector (descriptor) from histograms
     hists_to_vec(histograms, kp.descriptor);
-    auto sift_end = std::chrono::high_resolution_clock::now();
-    total_descriptor_time += sift_end - sift_start;
+}
+
+// Place this helper function somewhere in your sift.cpp file.
+void create_mpi_keypoint_type(MPI_Datatype* mpi_keypoint_type) {
+    // A Keypoint contains 4 floats, 4 ints, and 128 uint8_t's
+    const int nitems = 3;
+
+    // Setup the description of the struct's members
+    int blocklengths[nitems] = {4, 4, 128};
+    MPI_Datatype types[nitems] = {MPI_FLOAT, MPI_INT, MPI_UINT8_T};
+    MPI_Aint offsets[nitems];
+
+    // Create a dummy instance to calculate memory offsets
+    Keypoint kp_dummy;
+    MPI_Aint base_address;
+    MPI_Get_address(&kp_dummy, &base_address);
+    MPI_Get_address(&kp_dummy.x, &offsets[0]);
+    MPI_Get_address(&kp_dummy.i, &offsets[1]);
+    MPI_Get_address(&kp_dummy.descriptor, &offsets[2]);
+
+    // Make offsets relative to the start of the struct
+    for (int i = 0; i < nitems; ++i) {
+        offsets[i] -= base_address;
+    }
+
+    // Create and commit the custom MPI datatype
+    MPI_Type_create_struct(nitems, blocklengths, offsets, types, mpi_keypoint_type);
+    MPI_Type_commit(mpi_keypoint_type);
+}
+
+void exchange_ghost_rows(
+    const std::vector<float>& local_data,
+    std::vector<float>& top_ghost_buffer,
+    std::vector<float>& bottom_ghost_buffer,
+    int rows_to_exchange, int width, int local_height, int channels,
+    int rank, int world_size) {
+
+    if (rows_to_exchange <= 0) return;
+
+    int top_neighbor = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
+    int bottom_neighbor = (rank < world_size - 1) ? rank + 1 : MPI_PROC_NULL;
+    
+    int buffer_size = rows_to_exchange * width * channels;
+
+    // We don't need to resize the buffers here, we assume the caller did it.
+
+    // Exchange with top neighbor
+    MPI_Sendrecv(
+        &local_data[0],                                    // Send my top rows
+        buffer_size, MPI_FLOAT, top_neighbor, 0,
+        top_ghost_buffer.data(),                           // Receive into my top ghost buffer
+        buffer_size, MPI_FLOAT, top_neighbor, 0,
+        MPI_COMM_WORLD, MPI_STATUS_IGNORE
+    );
+
+    // Exchange with bottom neighbor
+    const float* my_bottom_rows_start = &local_data[(local_height - rows_to_exchange) * width * channels];
+    MPI_Sendrecv(
+        my_bottom_rows_start,                              // Send my bottom rows
+        buffer_size, MPI_FLOAT, bottom_neighbor, 1,
+        bottom_ghost_buffer.data(),                        // Receive into my bottom ghost buffer
+        buffer_size, MPI_FLOAT, bottom_neighbor, 1,
+        MPI_COMM_WORLD, MPI_STATUS_IGNORE
+    );
 }
 
 std::vector<Keypoint> find_keypoints_and_descriptors(
@@ -537,89 +712,222 @@ std::vector<Keypoint> find_keypoints_and_descriptors(
     MPI_Comm_size(MPI_COMM_WORLD, &world);
 
     std::chrono::high_resolution_clock::time_point start_time, end_time;
-
-    // --- Timing for Gaussian Pyramid ---
-    if (rank == 0) start_time = std::chrono::high_resolution_clock::now();
-
-    ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid_mpi(
+    if (rank == 0) {
+        start_time = std::chrono::high_resolution_clock::now();
+    }
+    ScaleSpacePyramid gaussian_pyramid_strip = generate_gaussian_pyramid_mpi(
         input, sigma_min, num_octaves, scales_per_octave);
+    ScaleSpacePyramid dog_pyramid_strip =
+        generate_dog_pyramid(gaussian_pyramid_strip);
+    ScaleSpacePyramid grad_pyramid_strip =
+        generate_gradient_pyramid(gaussian_pyramid_strip);
+    vector<Keypoint> local_keypoints = find_keypoints(dog_pyramid_strip, contrast_thresh, edge_thresh);
+   
+    for(Keypoint &kp_tmp: local_keypoints) {
+        
+    }
+    int initial_H = input.height * 2; // Full height of the base image in octave 0
+
+for (Keypoint& kp : local_keypoints) {
+    // 1. Determine the full height of the image for the keypoint's octave level.
+    //    The height is halved at each successive octave.
+    int octave_full_H = initial_H >> kp.octave;
+
+    // 2. Calculate this process's starting row offset for that octave height.
+    RowSplit split = split_rows(octave_full_H, world, rank);
+    int y_offset = split.y0;
+
+    // 3. Apply the offset to the keypoint's integer and sub-pixel coordinates.
+    kp.j += y_offset; // This is the integer grid coordinate.
+    kp.y += y_offset * MIN_PIX_DIST * std::pow(2, kp.octave); // This is the final sub-pixel coordinate.
+}
+    if (rank == 0) {
+        end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed =
+            end_time - start_time;
+        cout << "1. generate gaussian dog gradient strip: " << elapsed.count()
+             << " ms" << endl;
+    }
+    MPI_Datatype mpi_keypoint_type;
+    create_mpi_keypoint_type(&mpi_keypoint_type);
+
+    // 2. Each process sends the number of keypoints it found to the root
+    int local_kp_count = local_keypoints.size();
+    std::vector<int> all_kp_counts;
+    if (rank == 0) {
+        all_kp_counts.resize(world);
+    }
+    MPI_Gather(&local_kp_count, 1, MPI_INT,
+               rank == 0 ? all_kp_counts.data() : nullptr, 1, MPI_INT,
+               0, MPI_COMM_WORLD);
+
+    // 3. Root process prepares to receive all keypoints
+    std::vector<Keypoint> tmp_kps;  // This will hold all keypoints on rank 0
+    std::vector<int> displs;        // Displacements for Gatherv
+
+    if (rank == 0) {
+        displs.resize(world);
+        displs[0] = 0;
+        int total_kps = all_kp_counts[0];
+
+        for (int i = 1; i < world; ++i) {
+            total_kps += all_kp_counts[i];
+            displs[i] = displs[i - 1] + all_kp_counts[i - 1];
+        }
+        tmp_kps.resize(total_kps);
+    }
+
+    // 4. Gather all keypoints from all processes into tmp_kps on the root
+    MPI_Gatherv(local_keypoints.data(),                      // Send buffer
+                local_kp_count,                              // Send count
+                mpi_keypoint_type,                           // Send type
+                rank == 0 ? tmp_kps.data() : nullptr,        // Recv buffer
+                rank == 0 ? all_kp_counts.data() : nullptr,  // Recv counts array
+                rank == 0 ? displs.data() : nullptr,         // Displacements array
+                mpi_keypoint_type,                           // Recv type
+                0,                                           // Root process
+                MPI_COMM_WORLD);
+
+    // 5. Don't forget to free the MPI type when you're done with it
+    MPI_Type_free(&mpi_keypoint_type);
+
+    ScaleSpacePyramid dog_pyramid;
+    ScaleSpacePyramid gaussian_pyramid;
+    ScaleSpacePyramid grad_pyramid;
+
+    if (rank == 0) {
+        start_time = std::chrono::high_resolution_clock::now();
+
+        dog_pyramid.num_octaves = dog_pyramid_strip.num_octaves;
+        dog_pyramid.imgs_per_octave = dog_pyramid_strip.imgs_per_octave;
+        dog_pyramid.octaves.resize(dog_pyramid.num_octaves);
+
+        gaussian_pyramid.num_octaves = gaussian_pyramid_strip.num_octaves;
+        gaussian_pyramid.imgs_per_octave =
+            gaussian_pyramid_strip.imgs_per_octave;
+        gaussian_pyramid.octaves.resize(gaussian_pyramid.num_octaves);
+
+        grad_pyramid.num_octaves = grad_pyramid_strip.num_octaves;
+        grad_pyramid.imgs_per_octave = grad_pyramid_strip.imgs_per_octave;
+        grad_pyramid.octaves.resize(grad_pyramid.num_octaves);
+    }
+
+    int H_o = input.height * 2;
+    int W_o = input.width * 2;
+    // std::vector<int> counts, displs;
+
+    for (int oi = 0; oi < grad_pyramid_strip.num_octaves; ++oi) {
+        if (rank == 0) {
+            grad_pyramid.octaves[oi].resize(grad_pyramid_strip.octaves[oi].size());
+        }
+
+        // Calculate counts and displacements for a SINGLE channel plane.
+        // This will be the same for both Gx and Gy gathers.
+        std::vector<int> plane_counts(world), plane_displs(world);
+        if (rank == 0) {
+            for (int r = 0; r < world; ++r) {
+                auto s = split_rows(H_o, world, r);
+                plane_counts[r] = (s.y1 - s.y0) * W_o;  // Size of one channel's stripe
+                plane_displs[r] = s.y0 * W_o;           // Displacement within one channel plane
+            }
+        }
+
+        for (int si = 0; si < grad_pyramid_strip.octaves[oi].size(); ++si) {
+            const Image& local_im = grad_pyramid_strip.octaves[oi][si];
+            if (rank == 0) {
+                // Allocate the final 2-channel image on the root
+                grad_pyramid.octaves[oi][si] = Image(W_o, H_o, 2);
+            }
+
+            // --- Gather Channel 0 (Gx) ---
+            const int plane_size = local_im.width * local_im.height;
+            MPI_Gatherv(
+                local_im.data,  // Sender points to start of Gx data
+                plane_size, MPI_FLOAT,
+                rank == 0 ? grad_pyramid.octaves[oi][si].data : nullptr,  // Receiver points to start of Gx plane
+                rank == 0 ? plane_counts.data() : nullptr,
+                rank == 0 ? plane_displs.data() : nullptr,
+                MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+            // --- Gather Channel 1 (Gy) ---
+            MPI_Gatherv(
+                local_im.data + plane_size,  // Sender points to start of Gy data
+                plane_size, MPI_FLOAT,
+                rank == 0 ? grad_pyramid.octaves[oi][si].data + (W_o * H_o) : nullptr,  // Receiver points to start of Gy plane
+                rank == 0 ? plane_counts.data() : nullptr,
+                rank == 0 ? plane_displs.data() : nullptr,
+                MPI_FLOAT, 0, MPI_COMM_WORLD);
+        }
+        H_o /= 2;
+        W_o /= 2;
+    }
 
     if (rank == 0) {
         end_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed =
             end_time - start_time;
-        cout << "1. generate_gaussian_pyramid_mpi: " << elapsed.count() << " ms"
+        cout << "collect gauss and dog strips and : " << elapsed.count() << " ms"
              << endl;
+
+        cout << "begin debug" << endl;
     }
-    ScaleSpacePyramid dog_pyramid;
-    std::vector<Keypoint> tmp_kps;
-    ScaleSpacePyramid grad_pyramid;
-    // The rest of the pipeline only runs on Rank 0, where the full pyramid
-    // exists.
     if (rank == 0) {
-        // --- Timing for DoG Pyramid ---
-        start_time = std::chrono::high_resolution_clock::now();
-        dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-        end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed_dog =
-            end_time - start_time;
-        cout << "2. generate_dog_pyramid: " << elapsed_dog.count() << " ms"
-             << endl;
-
         // --- Timing for Find Keypoints ---
+        // start_time = std::chrono::high_resolution_clock::now();
+        // tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
+        // end_time = std::chrono::high_resolution_clock::now();
+        // std::chrono::duration<double, std::milli> elapsed_kps =
+        //     end_time - start_time;
+        // cout << "3. find_keypoints: " << elapsed_kps.count() << " ms" << endl;
+
+        // --- Timing for Orientations and Descriptors ---
         start_time = std::chrono::high_resolution_clock::now();
-        tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
-        end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed_kps =
-            end_time - start_time;
-        cout << "3. find_keypoints: " << elapsed_kps.count() << " ms" << endl;
+        auto total_orientation_time =
+            std::chrono::duration<double, std::milli>::zero();
+        auto total_descriptor_time =
+            std::chrono::duration<double, std::milli>::zero();
 
-        // --- Timing for Gradient Pyramid ---
-        start_time = std::chrono::high_resolution_clock::now();
-        grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
-        end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed_grad =
-            end_time - start_time;
-        cout << "4. generate_gradient_pyramid: " << elapsed_grad.count()
-             << " ms" << endl;
-    }
-    // --- Timing for Orientations and Descriptors ---
-    start_time = std::chrono::high_resolution_clock::now();
-    auto total_orientation_time =
-        std::chrono::duration<double, std::milli>::zero();
-    auto total_descriptor_time =
-        std::chrono::duration<double, std::milli>::zero();
-
-    std::vector<Keypoint> kps;
-    cout << tmp_kps.size() << endl;
-    kps.reserve(tmp_kps.size() * 2);
-    for (Keypoint& kp_tmp : tmp_kps) {
-        auto ori_start = std::chrono::high_resolution_clock::now();
-
-        std::vector<float> orientations = find_keypoint_orientations(
-            kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
-        auto ori_end = std::chrono::high_resolution_clock::now();
-        total_orientation_time += (ori_end - ori_start);
-        for (float theta : orientations) {
-            Keypoint kp = kp_tmp;
-            auto desc_start = std::chrono::high_resolution_clock::now();
-            compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
-            auto desc_end = std::chrono::high_resolution_clock::now();
-            total_descriptor_time += (desc_end - desc_start);
-            kps.push_back(kp);
+        std::vector<Keypoint> kps;
+        cout << tmp_kps.size() << endl;
+        kps.reserve(tmp_kps.size() * 2);
+        if (rank == 0) {
+            start_time = std::chrono::high_resolution_clock::now();
         }
-    }
-    end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed_desc =
-        end_time - start_time;
-    cout << "5. compute_orientations_and_descriptors: " << elapsed_desc.count()
-         << " ms" << endl;
-    cout << "   - 5a. find_keypoint_orientations (sum): "
-         << total_orientation_time.count() << " ms" << endl;
-    cout << "   - 5b. compute_keypoint_descriptor (sum): "
-         << total_descriptor_time.count() << " ms" << endl;
+#pragma omp parallel for
+        for (Keypoint& kp_tmp : tmp_kps) {
+            auto ori_start = std::chrono::high_resolution_clock::now();
 
-    return kps;
+            std::vector<float> orientations = find_keypoint_orientations(
+                kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
+            auto ori_end = std::chrono::high_resolution_clock::now();
+            total_orientation_time += (ori_end - ori_start);
+            for (float theta : orientations) {
+                Keypoint kp = kp_tmp;
+                auto desc_start = std::chrono::high_resolution_clock::now();
+                compute_keypoint_descriptor(kp, theta, grad_pyramid,
+                                            lambda_desc);
+                auto desc_end = std::chrono::high_resolution_clock::now();
+                total_descriptor_time += (desc_end - desc_start);
+                kps.push_back(kp);
+            }
+        }
+        if (rank == 0) {
+            end_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::milli> elapsed_desc =
+                end_time - start_time;
+            cout << "computer oreintations adn decripstrso"
+                 << elapsed_desc.count() << endl;
+        }
+        // cout << "5. compute_orientations_and_descriptors: " <<
+        // elapsed_desc.count()
+        //      << " ms" << endl;
+        // cout << "   - 5a. find_keypoint_orientations (sum): "
+        //      << total_orientation_time.count() << " ms" << endl;
+        // cout << "   - 5b. compute_keypoint_descriptor (sum): "
+        //      << total_descriptor_time.count() << " ms" << endl;
+
+        return kps;
+    }
 
     // Non-zero ranks return an empty vector as they did no work after the
     // pyramid generation.
