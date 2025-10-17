@@ -1,7 +1,7 @@
 # Makefile for hw2_sift project
 MPICXX   = mpicxx
 # If mpicxx is Apple Clang, see note below for OpenMP flags.
-MPIFLAGS = -std=c++17 -O3 -fopenmp -DDEBUG_MPI_CHECK
+MPIFLAGS = -std=c++17 -O3 -DDEBUG_MPI_CHECK -g -fsanitize=address
 INCLUDES = -I.
 
 TARGET   = hw2

@@ -467,17 +467,23 @@ void smooth_histogram(float hist[N_BINS]) {
 }
 
 std::vector<float> find_keypoint_orientations(
-    Keypoint& kp, const ScaleSpacePyramid& grad_pyramid, float lambda_ori,
-    float lambda_desc) {
+    Keypoint& kp, const ScaleSpacePyramid& grad_pyramid, float lambda_ori, float max_sigma,
+    float lambda_desc, int world, int rank, vector<vector<float>>& top_buffer, vector<vector<float>> &bot_buffer) {
     auto sift_start = std::chrono::high_resolution_clock::now();
 
     float pix_dist = MIN_PIX_DIST * std::pow(2, kp.octave);
     const Image& img_grad = grad_pyramid.octaves[kp.octave][kp.scale];
+    vector<float> & top_halo = top_buffer[kp.scale];
+    vector<float> & bot_halo = bot_buffer[kp.scale];
 
     // discard kp if too close to image borders
-    float min_dist_from_border =
-        std::min({kp.x, kp.y, pix_dist * img_grad.width - kp.x,
-                  pix_dist * img_grad.height - kp.y});
+    float min_y_from_border = min(kp.y, pix_dist * img_grad.height - kp.y);
+    float min_x_from_border = min(kp.x, pix_dist * img_grad.width - kp.x);
+    float min_dist_from_border = min_x_from_border;
+    if (rank == 0 || rank == world - 1) {
+        min_dist_from_border = min(min_x_from_border, min_y_from_border);
+    }
+
     if (min_dist_from_border <= std::sqrt(2) * lambda_desc * kp.sigma) {
         return {};
     }
@@ -491,12 +497,41 @@ std::vector<float> find_keypoint_orientations(
     int x_end = std::round((kp.x + patch_radius) / pix_dist);
     int y_start = std::round((kp.y - patch_radius) / pix_dist);
     int y_end = std::round((kp.y + patch_radius) / pix_dist);
-
+    int radius = static_cast<int>(ceil((3.0 * lambda_ori * max_sigma / pix_dist)));
+    int single_channel_buffer_size = radius * img_grad.width;
     // accumulate gradients in orientation histogram
     for (int x = x_start; x <= x_end; x++) {
         for (int y = y_start; y <= y_end; y++) {
-            gx = img_grad.get_pixel(x, y, 0);
-            gy = img_grad.get_pixel(x, y, 1);
+            float gx, gy;
+            if (y >= 0 && y < img_grad.height) {
+                // Case 1: Pixel is within the local image data
+                gx = img_grad.get_pixel(x, y, 0);
+                gy = img_grad.get_pixel(x, y, 1);
+            } else if (y < 0) {
+                // Case 2: Pixel is in the TOP halo buffer (from rank-1)
+                if (rank > 0) {
+                    int halo_y = y + radius; // Convert local y to halo's y
+                    if (halo_y >= 0) {
+                        int index = halo_y * img_grad.width + x;
+                        gx = top_halo[index];
+                        gy = top_halo[index + single_channel_buffer_size];
+                    } else { continue; } // Patch extends beyond the halo
+                } else { continue; } // Rank 0 has no top halo
+            } else { // y >= img_grad.height
+                // Case 3: Pixel is in the BOTTOM halo buffer (from rank+1)
+                if (rank < world - 1) {
+                    int halo_y = y - img_grad.height; // Convert local y to halo's y
+                    if (halo_y < radius) {
+                        int index = halo_y * img_grad.width + x;
+                        assert(index < bot_halo.size() && index >= 0);
+                        assert(index + single_channel_buffer_size < bot_halo.size());
+                        cout << bot_halo.size() << " bot halo size " << index << ' ' << rank << endl;
+                        
+                        gx = bot_halo[index];
+                        gy = bot_halo[index + single_channel_buffer_size];
+                    } else { continue; } // Patch extends beyond the halo
+                } else { continue; } // Last rank has no bottom halo
+            }
             grad_norm = std::sqrt(gx * gx + gy * gy);
             weight = std::exp(-(std::pow(x * pix_dist - kp.x, 2) +
                                 std::pow(y * pix_dist - kp.y, 2)) /
@@ -670,34 +705,31 @@ void exchange_ghost_rows(
     std::vector<float>& bottom_ghost_buffer,
     int rows_to_exchange, int width, int local_height, int channels,
     int rank, int world_size) {
-
     if (rows_to_exchange <= 0) return;
 
     int top_neighbor = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
     int bottom_neighbor = (rank < world_size - 1) ? rank + 1 : MPI_PROC_NULL;
-    
+
     int buffer_size = rows_to_exchange * width * channels;
 
     // We don't need to resize the buffers here, we assume the caller did it.
 
     // Exchange with top neighbor
     MPI_Sendrecv(
-        &local_data[0],                                    // Send my top rows
+        &local_data[0],  // Send my top rows
         buffer_size, MPI_FLOAT, top_neighbor, 0,
-        top_ghost_buffer.data(),                           // Receive into my top ghost buffer
+        top_ghost_buffer.data(),  // Receive into my top ghost buffer
         buffer_size, MPI_FLOAT, top_neighbor, 0,
-        MPI_COMM_WORLD, MPI_STATUS_IGNORE
-    );
+        MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
     // Exchange with bottom neighbor
     const float* my_bottom_rows_start = &local_data[(local_height - rows_to_exchange) * width * channels];
     MPI_Sendrecv(
-        my_bottom_rows_start,                              // Send my bottom rows
+        my_bottom_rows_start,  // Send my bottom rows
         buffer_size, MPI_FLOAT, bottom_neighbor, 1,
-        bottom_ghost_buffer.data(),                        // Receive into my bottom ghost buffer
+        bottom_ghost_buffer.data(),  // Receive into my bottom ghost buffer
         buffer_size, MPI_FLOAT, bottom_neighbor, 1,
-        MPI_COMM_WORLD, MPI_STATUS_IGNORE
-    );
+        MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
 
 std::vector<Keypoint> find_keypoints_and_descriptors(
@@ -722,146 +754,105 @@ std::vector<Keypoint> find_keypoints_and_descriptors(
     ScaleSpacePyramid grad_pyramid_strip =
         generate_gradient_pyramid(gaussian_pyramid_strip);
     vector<Keypoint> local_keypoints = find_keypoints(dog_pyramid_strip, contrast_thresh, edge_thresh);
-   
-    for(Keypoint &kp_tmp: local_keypoints) {
-        
+
+    vector<float> local_max_sigma(num_octaves);
+    for (auto& kp : local_keypoints) {
+        local_max_sigma[kp.octave] = max(kp.sigma, local_max_sigma[kp.octave]);
     }
-    int initial_H = input.height * 2; // Full height of the base image in octave 0
-
-for (Keypoint& kp : local_keypoints) {
-    // 1. Determine the full height of the image for the keypoint's octave level.
-    //    The height is halved at each successive octave.
-    int octave_full_H = initial_H >> kp.octave;
-
-    // 2. Calculate this process's starting row offset for that octave height.
-    RowSplit split = split_rows(octave_full_H, world, rank);
-    int y_offset = split.y0;
-
-    // 3. Apply the offset to the keypoint's integer and sub-pixel coordinates.
-    kp.j += y_offset; // This is the integer grid coordinate.
-    kp.y += y_offset * MIN_PIX_DIST * std::pow(2, kp.octave); // This is the final sub-pixel coordinate.
-}
-    if (rank == 0) {
-        end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed =
-            end_time - start_time;
-        cout << "1. generate gaussian dog gradient strip: " << elapsed.count()
-             << " ms" << endl;
+    vector<float> global_max_sigma(num_octaves);
+    vector<vector<Keypoint>> keypoints_by_octave (num_octaves);
+    for (const auto& p : local_keypoints) {
+        keypoints_by_octave[p.octave].push_back(p);
     }
-    MPI_Datatype mpi_keypoint_type;
-    create_mpi_keypoint_type(&mpi_keypoint_type);
+    MPI_Allreduce(local_max_sigma.data(),   // Your local data
+                  global_max_sigma.data(),  // Where to store the result
+                  num_octaves,              // Number of elements in the vector
+                  MPI_FLOAT,                // Data type
+                  MPI_MAX,                  // The operation: find the maximum
+                  MPI_COMM_WORLD);
+    cout << "rank " << rank << "has gotten the global max sigma" << endl;    
+    for (int i = 0; i < num_octaves; i++) {
+        float pix_dist = MIN_PIX_DIST * std::pow(2, i);
+        int radius = static_cast<int>(ceil((3.0 * lambda_ori * global_max_sigma[i] / pix_dist)));
+        int H = grad_pyramid_strip.octaves[i][0].height;
+        int W = grad_pyramid_strip.octaves[i][0].width;
 
-    // 2. Each process sends the number of keypoints it found to the root
-    int local_kp_count = local_keypoints.size();
-    std::vector<int> all_kp_counts;
-    if (rank == 0) {
-        all_kp_counts.resize(world);
-    }
-    MPI_Gather(&local_kp_count, 1, MPI_INT,
-               rank == 0 ? all_kp_counts.data() : nullptr, 1, MPI_INT,
-               0, MPI_COMM_WORLD);
-
-    // 3. Root process prepares to receive all keypoints
-    std::vector<Keypoint> tmp_kps;  // This will hold all keypoints on rank 0
-    std::vector<int> displs;        // Displacements for Gatherv
-
-    if (rank == 0) {
-        displs.resize(world);
-        displs[0] = 0;
-        int total_kps = all_kp_counts[0];
-
-        for (int i = 1; i < world; ++i) {
-            total_kps += all_kp_counts[i];
-            displs[i] = displs[i - 1] + all_kp_counts[i - 1];
+        radius = std::max(0, std::min(radius, H));   
+        if (radius == 0) {
+            cout << "no rows exchanged" <<endl;
+            // No rows to exchange on this scale
+            continue;
         }
-        tmp_kps.resize(total_kps);
-    }
+        int image_width = grad_pyramid_strip.octaves[i][0].width;
+        int single_channel_buffer_size = radius * image_width;
+        int total_buffer_size = single_channel_buffer_size * 2;
+            
+        vector<vector<float>> top_recv_buffer(scales_per_octave + 1, vector<float>(total_buffer_size));
+        vector<vector<float>> bot_recv_buffer(scales_per_octave + 1, vector<float>(total_buffer_size));
+        vector<float> top_send_buffer(total_buffer_size);
+        vector<float> bot_send_buffer(total_buffer_size);
+        for (int j = 0; j <= scales_per_octave; j++) {
+            Image& current_image = grad_pyramid_strip.octaves[i][j];
+            memcpy(top_send_buffer.data(),
+                    current_image.data,
+                    single_channel_buffer_size * sizeof(float));
+            memcpy(top_send_buffer.data() + single_channel_buffer_size, // Offset
+                    current_image.data + current_image.width * current_image.height,
+                    single_channel_buffer_size * sizeof(float));
+            
+            int start_of_bottom_data = (current_image.height - radius) * image_width;
 
-    // 4. Gather all keypoints from all processes into tmp_kps on the root
-    MPI_Gatherv(local_keypoints.data(),                      // Send buffer
-                local_kp_count,                              // Send count
-                mpi_keypoint_type,                           // Send type
-                rank == 0 ? tmp_kps.data() : nullptr,        // Recv buffer
-                rank == 0 ? all_kp_counts.data() : nullptr,  // Recv counts array
-                rank == 0 ? displs.data() : nullptr,         // Displacements array
-                mpi_keypoint_type,                           // Recv type
-                0,                                           // Root process
-                MPI_COMM_WORLD);
-
-    // 5. Don't forget to free the MPI type when you're done with it
-    MPI_Type_free(&mpi_keypoint_type);
-
-    ScaleSpacePyramid dog_pyramid;
-    ScaleSpacePyramid gaussian_pyramid;
-    ScaleSpacePyramid grad_pyramid;
-
-    if (rank == 0) {
-        start_time = std::chrono::high_resolution_clock::now();
-
-        dog_pyramid.num_octaves = dog_pyramid_strip.num_octaves;
-        dog_pyramid.imgs_per_octave = dog_pyramid_strip.imgs_per_octave;
-        dog_pyramid.octaves.resize(dog_pyramid.num_octaves);
-
-        gaussian_pyramid.num_octaves = gaussian_pyramid_strip.num_octaves;
-        gaussian_pyramid.imgs_per_octave =
-            gaussian_pyramid_strip.imgs_per_octave;
-        gaussian_pyramid.octaves.resize(gaussian_pyramid.num_octaves);
-
-        grad_pyramid.num_octaves = grad_pyramid_strip.num_octaves;
-        grad_pyramid.imgs_per_octave = grad_pyramid_strip.imgs_per_octave;
-        grad_pyramid.octaves.resize(grad_pyramid.num_octaves);
-    }
-
-    int H_o = input.height * 2;
-    int W_o = input.width * 2;
-    // std::vector<int> counts, displs;
-
-    for (int oi = 0; oi < grad_pyramid_strip.num_octaves; ++oi) {
-        if (rank == 0) {
-            grad_pyramid.octaves[oi].resize(grad_pyramid_strip.octaves[oi].size());
+            memcpy(bot_send_buffer.data(),
+                    current_image.data + start_of_bottom_data, // Offset
+                    single_channel_buffer_size * sizeof(float));
+            memcpy(bot_send_buffer.data() + single_channel_buffer_size, // Offset
+                    current_image.data + start_of_bottom_data + current_image.width * current_image.height, // Offset
+                    single_channel_buffer_size * sizeof(float));
+            int top_neighbor = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
+            int bot_neighbor = (rank < world - 1) ? rank + 1 : MPI_PROC_NULL;
+            cout << "rank " << rank << "is starting to send buffers" << endl;
+            MPI_Sendrecv(
+                top_send_buffer.data(),  // I SEND my TOP rows
+                total_buffer_size,
+                MPI_FLOAT,
+                top_neighbor,  // to my top neighbor
+                42,
+                top_recv_buffer[j].data(),  // I RECEIVE into my TOP buffer
+                total_buffer_size,
+                MPI_FLOAT,
+                top_neighbor,  // from my top neighbor
+                42,
+                MPI_COMM_WORLD,
+                MPI_STATUS_IGNORE);
+            cout << "rank " << rank << "middle of transfer" << endl;
+            MPI_Sendrecv(
+                bot_send_buffer.data(),  // I SEND my BOTTOM rows
+                total_buffer_size,
+                MPI_FLOAT,
+                bot_neighbor,  // to my bottom neighbor
+                42,
+                bot_recv_buffer[j].data(),  // I RECEIVE into my BOTTOM buffer
+                total_buffer_size,
+                MPI_FLOAT,
+                bot_neighbor,  // from my bottom neighbor
+                42,
+                MPI_COMM_WORLD,
+                MPI_STATUS_IGNORE);
+                cout << "rank " << rank << "is ending to send buffers" << endl;
+            // send rows to somewhere
+            // recv rows in recv_buffer[i][j]
         }
-
-        // Calculate counts and displacements for a SINGLE channel plane.
-        // This will be the same for both Gx and Gy gathers.
-        std::vector<int> plane_counts(world), plane_displs(world);
-        if (rank == 0) {
-            for (int r = 0; r < world; ++r) {
-                auto s = split_rows(H_o, world, r);
-                plane_counts[r] = (s.y1 - s.y0) * W_o;  // Size of one channel's stripe
-                plane_displs[r] = s.y0 * W_o;           // Displacement within one channel plane
-            }
+        for(auto &kp_tmp :  keypoints_by_octave[i]) {
+            vector<float> orientations = 
+            find_keypoint_orientations(kp_tmp, grad_pyramid_strip, lambda_ori, global_max_sigma[i], lambda_desc, 
+                world, rank, top_recv_buffer, bot_recv_buffer);
         }
-
-        for (int si = 0; si < grad_pyramid_strip.octaves[oi].size(); ++si) {
-            const Image& local_im = grad_pyramid_strip.octaves[oi][si];
-            if (rank == 0) {
-                // Allocate the final 2-channel image on the root
-                grad_pyramid.octaves[oi][si] = Image(W_o, H_o, 2);
-            }
-
-            // --- Gather Channel 0 (Gx) ---
-            const int plane_size = local_im.width * local_im.height;
-            MPI_Gatherv(
-                local_im.data,  // Sender points to start of Gx data
-                plane_size, MPI_FLOAT,
-                rank == 0 ? grad_pyramid.octaves[oi][si].data : nullptr,  // Receiver points to start of Gx plane
-                rank == 0 ? plane_counts.data() : nullptr,
-                rank == 0 ? plane_displs.data() : nullptr,
-                MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-            // --- Gather Channel 1 (Gy) ---
-            MPI_Gatherv(
-                local_im.data + plane_size,  // Sender points to start of Gy data
-                plane_size, MPI_FLOAT,
-                rank == 0 ? grad_pyramid.octaves[oi][si].data + (W_o * H_o) : nullptr,  // Receiver points to start of Gy plane
-                rank == 0 ? plane_counts.data() : nullptr,
-                rank == 0 ? plane_displs.data() : nullptr,
-                MPI_FLOAT, 0, MPI_COMM_WORLD);
-        }
-        H_o /= 2;
-        W_o /= 2;
     }
-
+    // Perform the reduction to find the global max for each octave
+          // The communicator
+    cout << rank << "XD: ";
+    for (int i = 0; i < global_max_sigma.size(); i++) cout << global_max_sigma[i] << ' ';
+    cout << endl;
     if (rank == 0) {
         end_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed =
@@ -873,60 +864,54 @@ for (Keypoint& kp : local_keypoints) {
     }
     if (rank == 0) {
         // --- Timing for Find Keypoints ---
-        // start_time = std::chrono::high_resolution_clock::now();
-        // tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
-        // end_time = std::chrono::high_resolution_clock::now();
-        // std::chrono::duration<double, std::milli> elapsed_kps =
-        //     end_time - start_time;
-        // cout << "3. find_keypoints: " << elapsed_kps.count() << " ms" << endl;
+        //         // start_time = std::chrono::high_resolution_clock::now();
+        //         // tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
+        //         // end_time = std::chrono::high_resolution_clock::now();
+        //         // std::chrono::duration<double, std::milli> elapsed_kps =
+        //         //     end_time - start_time;
+        //         // cout << "3. find_keypoints: " << elapsed_kps.count() << " ms" << endl;
 
-        // --- Timing for Orientations and Descriptors ---
-        start_time = std::chrono::high_resolution_clock::now();
-        auto total_orientation_time =
-            std::chrono::duration<double, std::milli>::zero();
-        auto total_descriptor_time =
-            std::chrono::duration<double, std::milli>::zero();
+        //         // --- Timing for Orientations and Descriptors ---
+        //         std::vector<Keypoint> kps;
+        //         cout << tmp_kps.size() << endl;
+        //         kps.reserve(tmp_kps.size() * 2);
+        //         if (rank == 0) {
+        //             start_time = std::chrono::high_resolution_clock::now();
+        //         }
+        // #pragma omp parallel for
+        //         for (Keypoint& kp_tmp : tmp_kps) {
+        //             auto ori_start = std::chrono::high_resolution_clock::now();
 
-        std::vector<Keypoint> kps;
-        cout << tmp_kps.size() << endl;
-        kps.reserve(tmp_kps.size() * 2);
-        if (rank == 0) {
-            start_time = std::chrono::high_resolution_clock::now();
-        }
-#pragma omp parallel for
-        for (Keypoint& kp_tmp : tmp_kps) {
-            auto ori_start = std::chrono::high_resolution_clock::now();
+        //             std::vector<float> orientations = find_keypoint_orientations(
+        //                 kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
+        //             auto ori_end = std::chrono::high_resolution_clock::now();
+        //             total_orientation_time += (ori_end - ori_start);
+        //             for (float theta : orientations) {
+        //                 Keypoint kp = kp_tmp;
+        //                 auto desc_start = std::chrono::high_resolution_clock::now();
+        //                 compute_keypoint_descriptor(kp, theta, grad_pyramid,
+        //                                             lambda_desc);
+        //                 auto desc_end = std::chrono::high_resolution_clock::now();
+        //                 total_descriptor_time += (desc_end - desc_start);
+        //                 kps.push_back(kp);
+        //             }
+        //         }
+        //         if (rank == 0) {
+        //             end_time = std::chrono::high_resolution_clock::now();
+        //             std::chrono::duration<double, std::milli> elapsed_desc =
+        //                 end_time - start_time;
+        //             cout << "computer oreintations adn decripstrso"
+        //                  << elapsed_desc.count() << endl;
+        //         }
+        //         // cout << "5. compute_orientations_and_descriptors: " <<
+        //         // elapsed_desc.count()
+        //         //      << " ms" << endl;
+        //         // cout << "   - 5a. find_keypoint_orientations (sum): "
+        //         //      << total_orientation_time.count() << " ms" << endl;
+        //         // cout << "   - 5b. compute_keypoint_descriptor (sum): "
+        //         //      << total_descriptor_time.count() << " ms" << endl;
 
-            std::vector<float> orientations = find_keypoint_orientations(
-                kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
-            auto ori_end = std::chrono::high_resolution_clock::now();
-            total_orientation_time += (ori_end - ori_start);
-            for (float theta : orientations) {
-                Keypoint kp = kp_tmp;
-                auto desc_start = std::chrono::high_resolution_clock::now();
-                compute_keypoint_descriptor(kp, theta, grad_pyramid,
-                                            lambda_desc);
-                auto desc_end = std::chrono::high_resolution_clock::now();
-                total_descriptor_time += (desc_end - desc_start);
-                kps.push_back(kp);
-            }
-        }
-        if (rank == 0) {
-            end_time = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::milli> elapsed_desc =
-                end_time - start_time;
-            cout << "computer oreintations adn decripstrso"
-                 << elapsed_desc.count() << endl;
-        }
-        // cout << "5. compute_orientations_and_descriptors: " <<
-        // elapsed_desc.count()
-        //      << " ms" << endl;
-        // cout << "   - 5a. find_keypoint_orientations (sum): "
-        //      << total_orientation_time.count() << " ms" << endl;
-        // cout << "   - 5b. compute_keypoint_descriptor (sum): "
-        //      << total_descriptor_time.count() << " ms" << endl;
-
-        return kps;
+        //         return kps;
     }
 
     // Non-zero ranks return an empty vector as they did no work after the

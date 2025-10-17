@@ -21,8 +21,8 @@ Image::Image(std::string file_path)
 
     size = width * height * channels;
     data = new float[size]; 
-    for (int x = 0; x < width; x++) {
-        for (int y = 0; y < height; y++) {
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
             for (int c = 0; c < channels; c++) {
                 int src_idx = y*width*channels + x*channels + c;
                 int dst_idx = c*height*width + y*width + x;
@@ -117,8 +117,8 @@ Image& Image::operator=(Image&& other)
 bool Image::save(std::string file_path)
 {
     unsigned char *out_data = new unsigned char[width*height*channels]; 
-    for (int x = 0; x < width; x++) {
-        for (int y = 0; y < height; y++) {
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
             for (int c = 0; c < channels; c++) {
                 int dst_idx = y*width*channels + x*channels + c;
                 int src_idx = c*height*width + y*width + x;
@@ -179,8 +179,8 @@ Image Image::resize(int new_w, int new_h, Interpolation method) const
 {
     Image resized(new_w, new_h, this->channels);
     float value = 0;
-    for (int x = 0; x < new_w; x++) {
-        for (int y = 0; y < new_h; y++) {
+    for (int y = 0; y < new_h; y++) {
+        for (int x = 0; x < new_w; x++) {
             for (int c = 0; c < resized.channels; c++) {
                 float old_x = map_coordinate(this->width, new_w, x);
                 float old_y = map_coordinate(this->height, new_h, y);
@@ -218,8 +218,8 @@ Image rgb_to_grayscale(const Image& img)
 {
     assert(img.channels == 3);
     Image gray(img.width, img.height, 1);
-    for (int x = 0; x < img.width; x++) {
-        for (int y = 0; y < img.height; y++) {
+    for (int y = 0; y < img.height; y++){
+       for (int x = 0; x < img.width; x++){
             float red, green, blue;
             red = img.get_pixel(x, y, 0);
             green = img.get_pixel(x, y, 1);
@@ -234,8 +234,8 @@ Image grayscale_to_rgb(const Image& img)
 {
     assert(img.channels == 1);
     Image rgb(img.width, img.height, 3);
-    for (int x = 0; x < img.width; x++) {
-        for (int y = 0; y < img.height; y++) {
+     for (int y = 0; y < img.height; y++){
+        for (int x = 0; x < img.width; x++)  {
             float gray_val = img.get_pixel(x, y, 0);
             rgb.set_pixel(x, y, 0, gray_val);
             rgb.set_pixel(x, y, 1, gray_val);
@@ -268,8 +268,8 @@ Image gaussian_blur(const Image& img, float sigma)
     Image filtered(img.width, img.height, 1);
 
     // convolve vertical
-    for (int x = 0; x < img.width; x++) {
-        for (int y = 0; y < img.height; y++) {
+    for (int y = 0; y < img.height; y++) {
+        for (int x = 0; x < img.width; x++){
             float sum = 0;
             for (int k = 0; k < size; k++) {
                 int dy = -center + k;
@@ -279,8 +279,8 @@ Image gaussian_blur(const Image& img, float sigma)
         }
     }
     // convolve horizontal
-    for (int x = 0; x < img.width; x++) {
-        for (int y = 0; y < img.height; y++) {
+    for (int y = 0; y < img.height; y++)  {
+        for (int x = 0; x < img.width; x++) {
             float sum = 0;
             for (int k = 0; k < size; k++) {
                 int dx = -center + k;
